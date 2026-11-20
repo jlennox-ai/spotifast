@@ -17,6 +17,32 @@ const FOLDERS: fastframe_dirs::App = fastframe_dirs::App {
     ..fastframe_dirs::App::new("spotifast", "me", "paolino", "spotifast")
 };
 
+/// Names a folder to keep every file in, as a portable copy keeps them in
+/// `spotifast-data`, on any platform and wherever the executable is.
+const PORTABLE_ENV: &str = "SPOTIFAST_PORTABLE";
+
+/// The folder `SPOTIFAST_PORTABLE` names, made absolute so a later change of
+/// directory cannot move it. Unset or empty means none.
+fn env_folder() -> Option<PathBuf> {
+    folder_from(std::env::var_os(PORTABLE_ENV), std::env::current_dir().ok())
+}
+
+fn folder_from(value: Option<std::ffi::OsString>, current: Option<PathBuf>) -> Option<PathBuf> {
+    let folder = PathBuf::from(value.filter(|value| !value.is_empty())?);
+    Some(match current {
+        Some(current) if folder.is_relative() => current.join(folder),
+        _ => folder,
+    })
+}
+
+/// 64-bit FNV-1a, the same in every build, so one folder always names the
+/// same single-instance slot.
+fn fnv1a(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct AppDirs {
     pub config: PathBuf,
@@ -75,6 +101,9 @@ impl AppDirs {
     /// time from the per-user ones, or the per-user ones. Call it once this
     /// process is the running copy, before the window opens.
     pub fn discover() -> Found {
+        if let Some(folder) = env_folder() {
+            return Self::discover_in(folder);
+        }
         let found = FOLDERS.discover(|copy, from| {
             // The copy starts with the sign-in it was made from, under
             // credential entries of its own.
@@ -108,6 +137,30 @@ impl AppDirs {
         }
     }
 
+    /// The folders inside `folder`, which `SPOTIFAST_PORTABLE` named. It
+    /// starts empty: nothing is copied from the per-user folders.
+    fn discover_in(folder: PathBuf) -> Found {
+        let dirs = Self::from(fastframe_dirs::Dirs::inside(&folder));
+        let mut lines = vec![(
+            log::Level::Info,
+            format!("{PORTABLE_ENV}: keeping files in {}", folder.display()),
+        )];
+        // Its sign-in follows the folder, as a portable copy's does.
+        if let Err(error) = std::fs::create_dir_all(&dirs.state)
+            .and_then(|()| crate::credentials::keep_profile(&dirs.state))
+        {
+            lines.push((
+                log::Level::Warn,
+                format!("unable to record the portable credential profile: {error}"),
+            ));
+        }
+        Found {
+            dirs,
+            portable: true,
+            lines,
+        }
+    }
+
     /// The per-user folders, which an installed copy uses whether or not
     /// this copy is portable.
     pub fn installed() -> Self {
@@ -118,7 +171,10 @@ impl AppDirs {
     /// hands its launches to an installed copy, or to a portable copy in
     /// another folder, which keep other settings.
     pub fn instance_scope() -> Option<String> {
-        FOLDERS.portable().instance_scope()
+        match env_folder() {
+            Some(folder) => Some(env_scope(&folder)),
+            None => FOLDERS.portable().instance_scope(),
+        }
     }
 
     /// No home folder at all: the current directory.
@@ -262,6 +318,24 @@ impl AppDirs {
         }
         Ok(())
     }
+}
+
+/// The single-instance slot of a copy using `SPOTIFAST_PORTABLE`'s
+/// `folder`: its own, apart from an installed copy's and a marked portable
+/// copy's, and the same for every spelling Windows takes as that folder.
+fn env_scope(folder: &Path) -> String {
+    // The folder may not exist yet; its parent is resolved, so the name is
+    // the same before and after the first run makes it.
+    let resolved = folder
+        .parent()
+        .zip(folder.file_name())
+        .and_then(|(parent, name)| std::fs::canonicalize(parent).ok().map(|p| p.join(name)))
+        .unwrap_or_else(|| folder.to_path_buf());
+    let mut key = resolved.to_string_lossy().into_owned();
+    if cfg!(windows) {
+        key = key.to_lowercase();
+    }
+    format!("portable-env-{:016x}", fnv1a(&key))
 }
 
 /// One account's JSON file name. Hex encoding also keeps unusual account
@@ -414,6 +488,45 @@ mod tests {
             line.contains("not usable") && line.contains("/user"),
             "{line}"
         );
+    }
+
+    /// `SPOTIFAST_PORTABLE` names the folder, relative to where Spotifast
+    /// started; unset or empty leaves the usual folders.
+    #[test]
+    fn the_portable_variable_names_the_folder() {
+        let here = PathBuf::from("/home/me");
+        assert_eq!(folder_from(None, Some(here.clone())), None);
+        assert_eq!(folder_from(Some("".into()), Some(here.clone())), None);
+        assert_eq!(
+            folder_from(Some("music".into()), Some(here.clone())),
+            Some(here.join("music"))
+        );
+        let absolute = std::env::temp_dir().join("spotifast-portable");
+        assert_eq!(
+            folder_from(Some(absolute.clone().into_os_string()), Some(here)),
+            Some(absolute)
+        );
+    }
+
+    /// A copy using `SPOTIFAST_PORTABLE` keeps every file in that folder,
+    /// remembers its window there, and has a slot of its own that does not
+    /// change once the folder exists.
+    #[test]
+    fn a_copy_using_the_portable_variable_keeps_everything_in_its_folder() {
+        let dir = folder("portable-env");
+        let data = dir.join("data");
+        let scope = env_scope(&data);
+        let found = AppDirs::discover_in(data.clone());
+        assert_eq!(found.dirs.config, data.join("config"));
+        assert_eq!(found.dirs.state, data.join("state"));
+        assert_eq!(found.dirs.cache, data.join("cache"));
+        assert_eq!(
+            found.window_file(),
+            Some(data.join("state").join("app.ron"))
+        );
+        assert_eq!(env_scope(&data), scope);
+        assert_ne!(env_scope(&dir.join("other")), scope);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Installed copies, and every copy on Linux and macOS, keep the folders

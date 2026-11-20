@@ -332,6 +332,15 @@ it is through updates and their rollback. To start a portable copy afresh,
 quit it and delete `spotifast-data`; the next start copies from the folders
 above again.
 
+To keep the files in a folder of your choosing instead, on any platform, set
+the `SPOTIFAST_PORTABLE` environment variable to that folder before starting
+Spotifast, for example `SPOTIFAST_PORTABLE=D:\Spotifast`. It takes precedence
+over `spotifast-data`, and a relative path is taken from the directory
+Spotifast starts in. Spotifast makes `config`, `state` and `cache` inside it,
+as above, but a new folder starts empty: nothing is copied from the folders
+above, so you sign in again. Each folder gets its own running copy, so the
+installed Spotifast and copies using other folders run beside it.
+
 Spotify sign-ins themselves are saved in Windows Credential Manager, which
 belongs to your Windows account, not to a folder, with an encrypted copy in
 `state\credential-storage\` that only your Windows account can read. A
